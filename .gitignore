@@ -1,0 +1,6 @@
+# Archon run/state cruft (appears if the workflow is run in-repo)
+.archon/state/
+.archon/artifacts/
+
+# OS junk
+.DS_Store

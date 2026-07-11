@@ -1,0 +1,52 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Example Archon config for the feature-dev-governed harness.
+#
+# Copy the relevant sections into your real config:
+#   - Global install:      ~/.archon/config.yaml   (applies to every repo)
+#   - Per-project install: <your-repo>/.archon/config.yaml
+#
+# The workflow itself carries NO install-specific model IDs. All Claude nodes use
+# `opus` (fallback `sonnet`); the two Codex nodes inherit `assistants.codex.model`
+# from the config below. See README.md for the full setup story.
+# ─────────────────────────────────────────────────────────────────────────────
+
+assistants:
+  claude:
+    # Default model for every Claude node in the workflow (research, synthesis,
+    # design, planning, implementation, review, merge monitoring). The nodes also
+    # declare `model: opus` explicitly and `fallbackModel: sonnet`, so this mainly
+    # documents intent — change the nodes' `model:` if you want a different default.
+    model: opus
+
+  codex:
+    # The two Codex nodes (research-codex, review-codex) carry NO `model:` line, so
+    # they inherit THIS value at runtime. Set it to whatever Codex model your install
+    # actually has available — run `archon ai list` or check `~/.codex/config.toml`.
+    model: gpt-5.5-codex
+    # Codex reasoning effort. The workflow sets `modelReasoningEffort: xhigh` at the
+    # workflow level, which the Codex nodes honor; this is the config-level default.
+    modelReasoningEffort: xhigh
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OPTIONAL: distinct Claude models per role for more review diversity.
+#
+# By default both Claude "roles" (the researcher/architect and the implementer/
+# reviewer) run the same `opus` model — the model diversity in this harness comes
+# from Claude-vs-Codex, not Claude-vs-Claude. If you want the researcher and the
+# implementer to run DIFFERENT Claude models, define aliases here and point the
+# workflow nodes' `model:` at them (e.g. `model: '@reasoner'`).
+#
+# CAVEAT: `@aliases` only resolve when the workflow runs at PROJECT scope (the
+# workflow lives in the target repo's `.archon/workflows/`). They are REJECTED for
+# globally-installed workflows in `~/.archon/workflows/`. The default `opus`-based
+# config above needs no aliases and works at BOTH scopes.
+#
+# aliases:
+#   '@reasoner':
+#     provider: claude
+#     model: opus         # e.g. your strongest reasoning model for research/design/plan
+#     effort: max
+#   '@implementer':
+#     provider: claude
+#     model: sonnet       # e.g. a faster model for the implementation/review roles
+#     effort: high

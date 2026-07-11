@@ -1,0 +1,731 @@
+name: feature-dev-governed
+description: |
+  Use when: You have a problem to investigate or a feature request and want a
+    governed flow that locks a strong design + plan upfront, then runs autonomously
+    from implementation through to a merged, verified PR.
+  Triggers: "governed feature", "feature dev governed", "research to pr",
+            "build this feature properly", "investigate and implement".
+  Does: Dual-model research (Claude + Codex, independent/parallel) -> synthesis & recommendation ->
+        interactive design agreement (ALL clarifying questions asked here) ->
+        Claude planning (code vs manual steps) -> single permission gate (auto-merge +
+        manual steps) -> THEN autonomous execution: docs-first PR (repo-appropriate
+        PRD/ADR/plan, opened as a draft) -> Claude subagent implementation into that same
+        PR -> dual-model review loop (Claude + Codex) -> finalize PR (template, ready) ->
+        autonomous merge monitoring (Gemini, CI, conflicts/rebase, conversation resolution,
+        auto-merge) until the PR is MERGED and verified working. Only significant blockers needing
+        human input surface/halt; routine issues are folded in automatically.
+  NOT for: Quick fixes, PRD authoring (use archon-interactive-prd), or pure code review
+           of an existing PR (use archon-smart-pr-review).
+
+# ── Governance / execution posture ────────────────────────────────────────────
+# Two-phase intent:
+#   1) UPFRONT (human-in-the-loop): research -> synthesize -> design (interactive Q&A)
+#      -> plan -> permission gate. Get the design/plan very strong and answer ALL
+#      clarifying questions here.
+#   2) AUTONOMOUS: docs-first PR -> implement -> review -> address-reviews -> finalize PR
+#      -> merge monitoring.
+#      Runs to completion without routine checkpoints. Only a SIGNIFICANT blocker
+#      requiring human input surfaces and halts.
+#
+# interactive: true — required for the upfront design loop + permission gate (web foreground).
+# provider: claude default; individual nodes override to Codex.
+# modelReasoningEffort: xhigh — Codex-only (Claude nodes ignore it; the Codex research/
+#   review nodes run at xhigh through it).
+# webSearchMode: live — lets Codex nodes reach up-to-date docs.
+# requires: [github] — hard-blocks before any cost if per-user GitHub identity isn't connected
+#   (no-op on solo PAT installs).
+#
+# Effort (Claude, per node): max for the design + plan deliverables; high (the default)
+#   for research/synthesis and the whole autonomous execution phase.
+#
+# ── Context & compaction (industry best practice) ─────────────────────────────
+# The harness manages context on four levels, so long autonomous runs don't exhaust
+# the window or drift:
+#   1) WITHIN a node — the provider SDK auto-compacts (Claude PreCompact/PostCompact,
+#      Codex/Pi/Copilot native compaction). We set no low maxTurns cap, so a long
+#      `implement` run self-manages.
+#   2) CROSS-ITERATION — the long autonomous loops (address-reviews, merge-readiness)
+#      run `fresh_context: true`: each iteration is a clean session that reconstructs
+#      state from DURABLE EXTERNAL MEMORY (artifact files + git/gh), so context stays
+#      bounded and re-reviews are unbiased. (The interactive `design` loop keeps shared
+#      context for conversational continuity — low token load — with design.md as the
+#      durable backing store.)
+#   3) CROSS-PHASE — phase-boundary nodes use `context: fresh` and pass forward
+#      compact summaries via `$node.output` + artifact docs (design.md, plan.md,
+#      review/*.md, progress.md, status.md) rather than dragging full transcripts.
+#   4) ISOLATION — implementation fans out to `implementer` subagents (Task tool),
+#      each with its own context window.
+#
+# ── Model configuration (portable) ────────────────────────────────────────────
+#   All Claude nodes use `opus` (fallback `sonnet`) — research / synthesis / design /
+#     planning / implementation / review / merge.
+#   The two Codex nodes (research-codex, review-codex) carry NO model: line, so each
+#     inherits the operator's configured `assistants.codex.model` at runtime.
+#   Effort stays inline per node: `max` for the design + plan deliverables, `high`
+#     elsewhere. Codex effort is workflow-level `modelReasoningEffort: xhigh`.
+#   To point these at different/stronger models, edit `assistants.*` (and optionally
+#     `aliases:`) in `.archon/config.yaml` — see the harness README.
+provider: claude
+interactive: true
+modelReasoningEffort: xhigh
+webSearchMode: live
+requires: [github]
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # PHASE 0: SETUP — scratch dirs + repo/git context
+  # ═══════════════════════════════════════════════════════════════════════════
+  - id: setup
+    bash: |
+      set -euo pipefail
+      mkdir -p "$ARTIFACTS_DIR/research" "$ARTIFACTS_DIR/design" \
+               "$ARTIFACTS_DIR/plan" "$ARTIFACTS_DIR/review" "$ARTIFACTS_DIR/merge"
+      echo "=== Problem / Request ==="
+      echo "$ARGUMENTS"
+      echo ""
+      echo "=== Git Context ==="
+      echo "BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+      echo "BASE_BRANCH=$BASE_BRANCH"
+      echo "HEAD=$(git rev-parse --short HEAD 2>/dev/null || echo '?')"
+      echo "REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo '?')"
+      echo ""
+      echo "=== Project Conventions (CLAUDE.md head) ==="
+      if [ -f CLAUDE.md ]; then head -40 CLAUDE.md; else echo "(no CLAUDE.md)"; fi
+    timeout: 30000
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # PHASE 1: RESEARCH — two models research INDEPENDENTLY, in parallel
+  #   research-fable and research-codex share the same predecessor (setup) and do
+  #   not depend on each other, so the engine runs them concurrently.
+  # ═══════════════════════════════════════════════════════════════════════════
+  - id: research-fable
+    depends_on: [setup]
+    model: opus
+    fallbackModel: sonnet
+    effort: high
+    idle_timeout: 600000
+    prompt: |
+      You are a principal engineer + domain researcher. Research the following problem
+      INDEPENDENTLY and rigorously. You are one of two researchers working in parallel;
+      do NOT assume what the other found — form your own view.
+
+      ## Problem / Request
+      $ARGUMENTS
+
+      ## Setup context
+      $setup.output
+
+      ## Your job
+      1. Explore the codebase for what already exists and how this fits (cite `file:line`).
+      2. Use web search + fetch the MOST UP-TO-DATE documentation / tooling docs / changelogs
+         for any library, framework, API, or standard involved. Prefer primary sources.
+      3. Evaluate 2-4 candidate approaches against INDUSTRY STANDARDS and RECOMMENDED BEST
+         PRACTICES (correctness, security, maintainability, testability, operational cost).
+      4. Note trade-offs, risks, unknowns, and any clarifying questions worth asking the user.
+
+      If web search is unavailable, say so explicitly and proceed from repo evidence + knowledge —
+      never silently pretend you verified docs you couldn't reach.
+
+      ## Output
+      Write your findings to `$ARTIFACTS_DIR/research/fable.md` (use the Write tool) with sections:
+      Summary · What Exists (with file:line) · Candidate Approaches · Best-Practice Assessment
+      (with cited sources/URLs) · Recommendation (your single best pick + why) · Risks & Unknowns ·
+      Open Questions for the user. Then print a short summary to stdout.
+
+  - id: research-codex
+    depends_on: [setup]
+    provider: codex
+    idle_timeout: 600000
+    prompt: |
+      You are a principal engineer + domain researcher. Research the following problem
+      INDEPENDENTLY and rigorously. You are one of two researchers working in parallel;
+      reach your OWN conclusion.
+
+      ## Problem / Request
+      $ARGUMENTS
+
+      ## Setup context
+      $setup.output
+
+      ## Your job
+      1. Explore the codebase for prior art and integration points (cite `file:line`).
+      2. Use live web search to pull the MOST UP-TO-DATE documentation / tooling docs for any
+         library, framework, API, or standard involved. Prefer primary sources.
+      3. Evaluate 2-4 candidate approaches against INDUSTRY STANDARDS and RECOMMENDED BEST
+         PRACTICES (correctness, security, maintainability, testability, operational cost).
+      4. Note trade-offs, risks, unknowns, and clarifying questions.
+
+      If web access is unavailable, say so explicitly rather than implying you verified docs.
+
+      ## Output
+      Write your findings to `$ARTIFACTS_DIR/research/codex.md` with sections:
+      Summary · What Exists (with file:line) · Candidate Approaches · Best-Practice Assessment
+      (with cited sources) · Recommendation (your single best pick + why) · Risks & Unknowns ·
+      Open Questions. Then print a short summary to stdout.
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # PHASE 2: SYNTHESIS — reconcile both, self-reassess until confident (single deep pass)
+  # ═══════════════════════════════════════════════════════════════════════════
+  - id: synthesize
+    depends_on: [research-fable, research-codex]
+    context: fresh
+    model: opus
+    fallbackModel: sonnet
+    effort: high
+    idle_timeout: 600000
+    prompt: |
+      You are the lead architect. Two independent researchers produced findings.
+
+      ## Fable research
+      $research-fable.output
+
+      ## Codex research
+      $research-codex.output
+
+      ## Also read the full docs on disk
+      Read `$ARTIFACTS_DIR/research/fable.md` and `$ARTIFACTS_DIR/research/codex.md` in full.
+
+      ## Your job — produce ONE recommendation, and be confident in it
+      1. Reconcile agreements and conflicts between the two researches.
+      2. Choose the single approach that is best against CORRECTNESS, INDUSTRY STANDARDS, and
+         RECOMMENDED BEST PRACTICES.
+      3. REASSESS your pick: re-check it against correctness, standards, and the most up-to-date
+         documentation/tooling docs (search the web to confirm current APIs/versions). Iterate
+         your own draft until you are genuinely confident it is the recommended solution —
+         explicitly list what you verified and any residual uncertainty.
+      4. Surface EVERY clarifying question the user should answer before design lock-in — the
+         design conversation is the last place questions get asked before autonomous execution.
+
+      ## Output
+      Write `$ARTIFACTS_DIR/design/recommendation.md` with: Recommendation (one clear approach) ·
+      Why It Wins (vs the alternatives) · Standards/Docs Verified (cited) · Scope Sketch ·
+      Key Risks & Mitigations · Confidence & Residual Unknowns · Clarifying Questions.
+      Then present the recommendation to the user conversationally and invite their input.
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # PHASE 3: DESIGN AGREEMENT — interactive back-and-forth until the user agrees.
+  #   This is the primary human touchpoint: because execution afterwards is AUTONOMOUS,
+  #   surface and resolve EVERY ambiguity and clarifying question here. effort: max.
+  # ═══════════════════════════════════════════════════════════════════════════
+  - id: design
+    depends_on: [synthesize]
+    model: opus
+    fallbackModel: sonnet
+    effort: max
+    idle_timeout: 600000
+    loop:
+      prompt: |
+        # Design agreement — collaborative (and the last stop for questions)
+
+        You are the lead architect converging on a design WITH the user. After this design is
+        approved, implementation → review → PR → merge run AUTONOMOUSLY with no routine
+        check-ins, so everything the agents will need MUST be nailed down here.
+
+        **Original request**: $ARGUMENTS
+        **Your standing recommendation**: read `$ARTIFACTS_DIR/design/recommendation.md`
+        **Working design so far**: read `$ARTIFACTS_DIR/design/design.md` if it exists
+        **User's latest input**: $LOOP_USER_INPUT
+
+        ## First iteration (no user input yet)
+        - Present the recommendation crisply and ask EVERY clarifying question you have
+          (scope boundaries, edge cases, non-goals, acceptance criteria, tech/architecture
+          decisions, testing/verification expectations, rollout/manual-step constraints).
+        - Do NOT emit the completion signal.
+
+        ## Subsequent iterations
+        - Read the user's input carefully. If they asked YOU a question, answer it with evidence
+          (cite file:line and, where relevant, current docs — search the web to confirm).
+        - If they requested changes, revise the design and re-check it against correctness,
+          industry standards, and recommended best practices.
+        - Keep `$ARTIFACTS_DIR/design/design.md` updated as the single source of truth (Scope
+          In/Out · Architecture & key decisions · Files/areas affected · Acceptance criteria &
+          how the result will be VERIFIED working · Risks · Resolved decisions). Use Write/Edit.
+
+        ## Completion
+        Only emit `<promise>DESIGN_APPROVED</promise>` when the user's LATEST message is an
+        EXPLICIT agreement ("agreed", "approved", "let's go with this", "proceed to planning")
+        AND you have no unresolved clarifying questions. Questions, feedback, or "also consider X"
+        are NOT approval — address them and continue.
+      until: DESIGN_APPROVED
+      max_iterations: 20
+      interactive: true
+      gate_message: |
+        Review the proposed design. Answer/ask clarifying questions, request changes, or say
+        "approved" to lock the design. After approval, execution runs autonomously — so raise
+        anything you want decided now.
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # PHASE 4: PLANNING — Claude (effort: max) turns the agreed design into an
+  #   implementation plan optimized for autonomous agentic execution; CODE/PR changes
+  #   vs MANUAL human steps are made explicit, plus an auto-merge recommendation.
+  # ═══════════════════════════════════════════════════════════════════════════
+  - id: plan
+    depends_on: [design]
+    context: fresh
+    model: opus
+    fallbackModel: sonnet
+    effort: max
+    output_type: plan
+    idle_timeout: 600000
+    prompt: |
+      You are a staff engineer writing an implementation plan from an AGREED design. The plan
+      will be executed AUTONOMOUSLY, so it must be complete, unambiguous, and self-contained —
+      an agent with no further human input should be able to finish the whole thing from it.
+
+      **Original request**: $ARGUMENTS
+      **Agreed design**: read `$ARTIFACTS_DIR/design/design.md` (and recommendation.md for context)
+
+      ## Requirements for the plan
+      - Optimize for AUTONOMOUS agentic implementation and review: minimize the number of PRs and
+        manual steps; prefer one cohesive PR unless a split is genuinely warranted (say why).
+      - Follow industry standards and recommended best practices; align with CLAUDE.md.
+      - Make EVERY step unambiguously one of:
+          [CODE]   — a code / PR change an agent will make autonomously
+          [MANUAL] — a human operator action (infra, secrets, dashboards, approvals, `tf apply`, …)
+        Put MANUAL steps in a dedicated table with: step · why it can't be code · WHEN to run it
+        (prefer AFTER merge from latest `$BASE_BRANCH`; if it must precede merge — e.g. bootstrap
+        `terraform apply` — note that latest base must be rebased into the branch first).
+      - Recommend whether AUTO-MERGE is advisable for this change and why.
+      - Include a task list ordered for the implementer, marking which tasks are independent
+        (parallelizable) vs dependent (sequential).
+      - Define VERIFICATION: the concrete checks/tests/observations that prove the goal is
+        achieved and the feature works as intended.
+      - List which docs will need updating.
+      - Call out any decision that, if it turns out wrong mid-execution, would be a SIGNIFICANT
+        blocker worth pausing for (so the executor knows what rises to that bar).
+
+      ## Output
+      Write `$ARTIFACTS_DIR/plan/plan.md` with sections: Summary · PR Strategy (how many, why) ·
+      Task List (with [independent]/[sequential] tags) · Manual Steps table · Auto-Merge
+      Recommendation · Verification (how we prove it works) · Docs to Update · Risks &
+      Pause-Worthy Decisions. Then present it to the user.
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # PHASE 5: PERMISSION GATE — the FINAL routine human gate. After this, execution
+  #   is autonomous. Capture decisions (auto-merge, manual steps) and REMEMBER them.
+  # ═══════════════════════════════════════════════════════════════════════════
+  - id: permissions-gate
+    depends_on: [plan]
+    approval:
+      message: |
+        Review the plan in `$ARTIFACTS_DIR/plan/plan.md`. This is the LAST routine check-in —
+        after you approve, implementation → review → PR → merge run autonomously to completion,
+        pausing only for a genuinely significant blocker. Please state:
+          1. Do you approve this plan? (approve / reject with feedback)
+          2. AUTO-MERGE: may I arm auto-merge once the PR is green, conversations resolved, and
+             conflict-free? (yes / no)
+          3. MANUAL STEPS: for each [MANUAL] step, may Archon apply it, or will you? And confirm
+             the timing (after-merge from latest base, or pre-action rebase where required).
+          4. Anything else you want decided upfront (scope guardrails, what counts as a
+             "significant blocker" worth halting for).
+        Your answers are remembered for the rest of the autonomous run.
+      capture_response: true
+      on_reject:
+        prompt: |
+          The user rejected the plan. Their feedback:
+          $REJECTION_REASON
+
+          Revise `$ARTIFACTS_DIR/plan/plan.md` to address it, keeping the [CODE]/[MANUAL]
+          split, the Manual Steps table, the Verification section, and the Auto-Merge
+          recommendation intact. Summarize what you changed, then re-present for approval.
+        max_attempts: 3
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # PHASE 5b: INITIAL DOCS PR (autonomous) — the FIRST execution step. Author the
+  #   docs the REPO's OWN convention calls for (PRD / ADR / plan — only the ones
+  #   appropriate for THIS task), commit them into the repo, and open the PR EARLY
+  #   as a draft. Implementation then lands code into this SAME PR (minimizes PRs).
+  # ═══════════════════════════════════════════════════════════════════════════
+  - id: docs-pr
+    depends_on: [permissions-gate]
+    context: fresh
+    model: opus
+    fallbackModel: sonnet
+    effort: high
+    idle_timeout: 600000
+    prompt: |
+      You are opening the change as a DOCS-FIRST pull request. Before any code is written, this
+      PR captures the durable docs the work needs, so reviewers see intent early and the rest of
+      the implementation lands into the SAME PR.
+
+      **Original request**: $ARGUMENTS
+      **Agreed design**: read `$ARTIFACTS_DIR/design/design.md`
+      **Implementation plan**: read `$ARTIFACTS_DIR/plan/plan.md`
+      **User's permission decisions (remember these)**: $permissions-gate.output
+
+      ## 1. Decide WHICH docs this task warrants — from the REPO's OWN convention
+      Do NOT invent a doc scheme. Discover how THIS repo decides when to create each doc type and
+      where each lives, then follow it exactly:
+        - Read CLAUDE.md, CONTRIBUTING*, the `docs/` tree, and any `.claude/skills/**` or
+          `.archon/**` guidance for the repo's documented rules on PRDs, ADRs, plans, RFCs, and
+          design docs — including their canonical directories and file-naming (e.g. in this repo
+          the `archon-dev` skill routes PRDs -> `.claude/archon/prds/` and plans ->
+          `.claude/archon/plans/`).
+        - Choose only the docs that are APPROPRIATE for THIS specific change. Not every task needs
+          a PRD or an ADR — create exactly what the convention calls for and no more. The plan's
+          "Docs to Update" section is a strong signal for what's warranted.
+      If the repo documents NO such convention, fall back to a single concise design note under
+      `docs/` and say explicitly that you did so — never guess an elaborate structure.
+
+      ## 2. Author the chosen docs INTO the repo (committed files, not artifacts)
+      Write each selected doc at its convention-defined repo path, derived from the agreed design
+      and plan. These are real repo files that ship in this PR — keep them accurate and scoped to
+      the task. (The `$ARTIFACTS_DIR/*` docs are scratch; these repo docs are the deliverable.)
+
+      ## 3. Open the PR EARLY as a DRAFT
+      - `git push -u origin HEAD` (this run is on an isolated branch cut from `$BASE_BRANCH`).
+      - If an open PR already exists for this branch, reuse it; otherwise create one:
+          - Base: `$BASE_BRANCH`. Create with `--draft` (implementation follows into this PR).
+          - Body: read `.github/PULL_REQUEST_TEMPLATE.md` and fill every section you can now (copy
+            it in via HEREDOC — `gh` does not auto-apply it). Mark not-yet-built sections
+            "pending implementation". If the request references an issue, add `Closes #<n>`.
+      - Stage ONLY the doc files you created (never `git add -A`; nothing under `$ARTIFACTS_DIR`).
+        Commit with a clear message (e.g. `docs: add PRD/ADR/plan for <feature>`).
+      - Print the PR URL and number.
+
+      ## If you hit a SIGNIFICANT blocker
+      If the repo's doc convention is genuinely ambiguous or contradicts the plan in a way that
+      needs a human call, record it in `$ARTIFACTS_DIR/plan/progress.md` under "NEEDS HUMAN INPUT"
+      with a recommended resolution and surface it in your output rather than guessing.
+
+      ## Output
+      Report which docs you created (with their repo paths), which you deliberately skipped and
+      why, and the PR URL/number. Downstream steps reuse THIS same PR.
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # PHASE 6: IMPLEMENTATION (autonomous) — Claude lead dispatches parallel subagents
+  #   for independent tasks; performs only [CODE] steps (manual steps deferred).
+  #   Lands code into the SAME branch/PR the docs-pr step already opened.
+  # ═══════════════════════════════════════════════════════════════════════════
+  - id: implement
+    depends_on: [docs-pr]
+    context: fresh
+    model: opus
+    fallbackModel: sonnet
+    effort: high
+    idle_timeout: 1800000
+    agents:
+      implementer:
+        description: >-
+          Autonomous implementation agent. Given ONE independent task from the plan,
+          implements it end-to-end following CLAUDE.md and best practices, self-validates
+          (type-check/lint/tests where fast), and reports exactly what it changed.
+        model: opus
+        tools: [Read, Write, Edit, Bash, Grep, Glob]
+        prompt: |
+          You implement a SINGLE task handed to you by the lead. Read the referenced files
+          and patterns first, follow CLAUDE.md and industry best practices, keep the change
+          tight and correct, and self-check (type-check/lint/relevant tests) before returning.
+          Return a concise report: files changed, decisions made, checks run + results, and any
+          issue you could not resolve. Do NOT perform manual/infra steps.
+    prompt: |
+      You are the LEAD implementation engineer. Execute the plan's [CODE] steps
+      AUTONOMOUSLY — no routine check-ins.
+
+      **Plan**: read `$ARTIFACTS_DIR/plan/plan.md`
+      **Agreed design**: read `$ARTIFACTS_DIR/design/design.md`
+      **User's permission decisions (remember these)**: $permissions-gate.output
+
+      ## How to execute
+      1. Extract the ordered task list. Do ONLY [CODE] tasks — never [MANUAL] steps (leave those
+         for the operator; the final summary will list them).
+      2. Parallelize where the plan marks tasks INDEPENDENT: dispatch them concurrently to the
+         `implementer` subagent via the Task tool (multiple Task calls in one turn). Run
+         dependent tasks sequentially, after their prerequisites land.
+      3. Integrate results, resolve any cross-task conflicts, and keep everything coherent.
+      4. Follow CLAUDE.md and recommended best practices. Update any docs the plan calls for.
+      5. Run the project's checks (e.g. `bun run validate`, or type-check/lint/test/format) and
+         fix what you find.
+      6. Commit incrementally with clear messages. Stage only files you changed (never `git add -A`).
+         Do not stage anything under `$ARTIFACTS_DIR` or scratch/PR-body files.
+
+      ## If you hit a SIGNIFICANT blocker
+      Small ambiguities: make the best standards-aligned decision and proceed (note it). But if
+      you hit something that could change the plan — the design appears wrong/infeasible, a
+      destructive/irreversible action is required, or a [MANUAL] prerequisite blocks progress —
+      do NOT guess: record it in `$ARTIFACTS_DIR/plan/progress.md` under "NEEDS HUMAN INPUT" with
+      a recommended fix + alternatives, stop that thread, and surface it in your final output.
+
+      Record progress + what remains (including deferred [MANUAL] steps) in
+      `$ARTIFACTS_DIR/plan/progress.md`. Finish with a summary of everything implemented.
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # PHASE 7: DUAL-MODEL REVIEW (autonomous) — Opus + Codex review the diff
+  #   INDEPENDENTLY (parallel). Each finding is tagged severity + RELEVANCE.
+  # ═══════════════════════════════════════════════════════════════════════════
+  - id: review-opus
+    depends_on: [implement]
+    context: fresh
+    model: opus
+    fallbackModel: sonnet
+    effort: high
+    idle_timeout: 900000
+    prompt: |
+      You are an independent code reviewer (primary, Claude). Review the changes on this branch for
+      CORRECTNESS and fit against INDUSTRY STANDARDS + RECOMMENDED BEST PRACTICES + CLAUDE.md,
+      and verify they actually implement the agreed design and satisfy its verification criteria.
+
+      ```bash
+      git fetch origin "$BASE_BRANCH" --quiet || true
+      git diff "origin/$BASE_BRANCH...HEAD" --stat
+      git diff "origin/$BASE_BRANCH...HEAD"
+      ```
+      Read `$ARTIFACTS_DIR/design/design.md` and `$ARTIFACTS_DIR/plan/plan.md` for intent.
+
+      Write `$ARTIFACTS_DIR/review/opus.md`. For EACH finding include: `file:line` · a concrete
+      fix · a severity (BLOCKING / MAJOR / MINOR / NIT) · and a RELEVANCE call (RELEVANT to this
+      change's correctness/standards, or OUT-OF-SCOPE / pre-existing / stylistic-preference) with
+      one line of rationale. Do not pad the list with nits or scope creep. End with an overall
+      verdict: APPROVE or CHANGES-REQUESTED, and a confidence level. Print the summary to stdout.
+
+  - id: review-codex
+    depends_on: [implement]
+    context: fresh
+    provider: codex
+    idle_timeout: 900000
+    prompt: |
+      You are an independent code reviewer (second opinion, Codex, xhigh). Review the branch changes for
+      CORRECTNESS and fit against INDUSTRY STANDARDS + RECOMMENDED BEST PRACTICES, and verify
+      they implement the agreed design and satisfy its verification criteria. Use live web search
+      to confirm any current-API/best-practice question.
+
+      ```bash
+      git fetch origin "$BASE_BRANCH" --quiet || true
+      git diff "origin/$BASE_BRANCH...HEAD" --stat
+      git diff "origin/$BASE_BRANCH...HEAD"
+      ```
+      Read `$ARTIFACTS_DIR/design/design.md` and `$ARTIFACTS_DIR/plan/plan.md` for intent.
+
+      Write `$ARTIFACTS_DIR/review/codex.md`. For EACH finding include: `file:line` · a concrete
+      fix · a severity (BLOCKING / MAJOR / MINOR / NIT) · and a RELEVANCE call (RELEVANT vs
+      OUT-OF-SCOPE / pre-existing / stylistic-preference) with one line of rationale. Do not pad
+      with nits or scope creep. End with an overall verdict: APPROVE or CHANGES-REQUESTED, and a
+      confidence level. Print the summary to stdout.
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # PHASE 7b: ADDRESS REVIEWS (autonomous loop) — Opus addresses the RELEVANT feedback
+  #   (justifying any it declines) and re-verifies each round (Opus natively + a Codex
+  #   second opinion via the codex CLI) until BOTH are satisfied and it is VERY CONFIDENT
+  #   the change is correct AND verified working as intended. effort: high (default).
+  # ═══════════════════════════════════════════════════════════════════════════
+  - id: address-reviews
+    depends_on: [review-opus, review-codex]
+    model: opus
+    fallbackModel: sonnet
+    effort: high
+    idle_timeout: 1800000
+    loop:
+      prompt: |
+        # Address code-review feedback until we are VERY CONFIDENT the PR is correct + working
+
+        You are the implementation engineer (Claude), resolving review feedback on this branch AUTONOMOUSLY. Aim for a
+        correct, standards-aligned, verified-working change — not the appeasement of every comment.
+
+        ## First, RELOAD STATE (this is a fresh session — no memory of prior iterations)
+        Reconstruct everything from durable memory; do not assume you remember anything:
+        - Read `$ARTIFACTS_DIR/review/opus.md` and `$ARTIFACTS_DIR/review/codex.md` (findings).
+        - Read `$ARTIFACTS_DIR/review/round-notes.md` if it exists (what prior rounds fixed/declined).
+        - `git log --oneline "origin/$BASE_BRANCH..HEAD"` to see what's already been done.
+        - Previous iteration's summary (may be empty on the first pass): $LOOP_PREV_OUTPUT
+
+        ## Each iteration
+        1. Triage every finding from BOTH reviewers. Address the ones that are RELEVANT and
+           WARRANTED — genuine correctness, security, design-mismatch, or clear best-practice
+           issues for THIS change. Apply fixes per CLAUDE.md + best practices; update docs if the
+           change warrants it. For findings you DECLINE (out-of-scope, pre-existing, stylistic
+           preference, or wrong), record a one-line justification in round-notes.md rather than
+           silently ignoring them. Do not make unrelated or scope-creeping changes.
+        2. Run the project checks (`bun run validate`, or type-check/lint/test/format) and fix
+           failures. Then VERIFY the goal is actually achieved per the plan's Verification section
+           (run the relevant tests/checks; exercise the feature if feasible). Commit fixes (stage
+           only changed files; never `git add -A`; nothing under `$ARTIFACTS_DIR`).
+        3. RE-VERIFY the current diff from TWO perspectives:
+           - Your own fresh Opus review of `git diff "origin/$BASE_BRANCH...HEAD"`.
+           - An independent Codex second opinion. Try:
+               `codex exec "Review this diff for correctness and best-practice
+                violations; list only BLOCKING/MAJOR issues with file:line" < <(git diff "origin/$BASE_BRANCH...HEAD")`
+             If the `codex` CLI is unavailable or errors, DO NOT pretend it passed — write
+             "Codex second-opinion unavailable: <reason>" into `$ARTIFACTS_DIR/review/round-notes.md`
+             and proceed on your own review for this round.
+        4. Write a short status to `$ARTIFACTS_DIR/review/round-notes.md`: what you fixed, what you
+           declined (with justification), verification result, and remaining relevant issues.
+
+        ## If a SIGNIFICANT blocker appears
+        If addressing feedback surfaces something that would change the design/plan or needs a
+        human decision, record it in round-notes.md under "NEEDS HUMAN INPUT" with a recommended
+        fix, and note it in your output rather than guessing.
+
+        ## Completion — only when VERY CONFIDENT
+        Emit `<promise>REVIEWS_ADDRESSED</promise>` ONLY when ALL hold:
+          - every RELEVANT, warranted finding is fixed (or declined with a recorded justification),
+          - your fresh review and the Codex second opinion both surface no remaining BLOCKING/MAJOR
+            issues,
+          - project checks pass AND the plan's verification confirms the goal works as intended,
+          - and you are genuinely VERY CONFIDENT the change is correct and standards-aligned.
+        Otherwise end the iteration normally (the loop auto-continues).
+      until: REVIEWS_ADDRESSED
+      max_iterations: 8
+      # Stateless iterations + durable external memory (round-notes.md, review docs, git):
+      # keeps context bounded across rounds and makes each re-review genuinely unbiased.
+      fresh_context: true
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # PHASE 8: FINALIZE PULL REQUEST (autonomous) — push code into the docs-first PR
+  #   opened back in Phase 5b, fill the full body, and flip it from draft to READY.
+  # ═══════════════════════════════════════════════════════════════════════════
+  - id: create-pr
+    depends_on: [address-reviews]
+    context: fresh
+    model: opus
+    fallbackModel: sonnet
+    effort: high
+    idle_timeout: 600000
+    prompt: |
+      You are finalizing the change into its pull request. An INITIAL DRAFT PR containing the
+      task's docs was already opened in the docs-first step; land the code into that SAME PR and
+      make it ready — do NOT open a second PR.
+
+      **User's permission decisions (auto-merge / manual steps)**: $permissions-gate.output
+
+      1. Push the branch (code commits from implementation/review): `git push -u origin HEAD`.
+      2. Locate the existing open PR for this branch (`gh pr list --head "$(git rev-parse --abbrev-ref HEAD)" --state open`).
+         It should already exist from Phase 5b — REUSE it. Only if none exists (e.g. it was closed),
+         create one with base `$BASE_BRANCH`.
+         - Body: read `.github/PULL_REQUEST_TEMPLATE.md` and FILL EVERY SECTION (the template is
+           not auto-applied via `gh`; copy it in via HEREDOC with `gh pr edit --body-file`).
+           Replace any "pending implementation" placeholders from the draft with the real content.
+         - If the original request references an issue, ensure `Closes #<n>` is present.
+         - Summarize the design, the docs shipped, the implementation, checks/verification run, and
+           list the deferred [MANUAL] steps from `$ARTIFACTS_DIR/plan/plan.md` with their timing.
+         - Flip the PR to READY (`gh pr ready <n>`) now that implementation + review are done —
+           UNLESS project checks are red, in which case leave it as a draft and say why.
+      3. Print the PR URL.
+
+      Run validation once more before creating the PR and note the result in the body:
+      `bun run validate 2>&1 | tail -20 || true`
+
+  - id: verify-pr-base
+    depends_on: [create-pr]
+    bash: |
+      set -euo pipefail
+      HEAD_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+      PR_NUMBER=$(gh pr list --head "$HEAD_BRANCH" --state open --json number -q '.[0].number')
+      if [ -z "$PR_NUMBER" ]; then
+        echo "No open PR found for branch $HEAD_BRANCH" >&2
+        exit 1
+      fi
+      ACTUAL=$(gh pr view "$PR_NUMBER" --json baseRefName -q '.baseRefName')
+      if [ "$ACTUAL" != "$BASE_BRANCH" ]; then
+        echo "Base mismatch on PR #$PR_NUMBER: expected=$BASE_BRANCH actual=$ACTUAL — re-targeting" >&2
+        gh pr edit "$PR_NUMBER" --base "$BASE_BRANCH"
+      else
+        echo "PR base verified: $BASE_BRANCH"
+      fi
+    timeout: 60000
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # PHASE 9: AUTONOMOUS MERGE MONITORING — non-interactive loop that drives the PR
+  #   to MERGED on its own: Gemini comments, required CI, conflicts/rebase, conversation
+  #   resolution, auto-merge, and monitoring until it actually merges. Routine waiting
+  #   auto-continues (no gate); only a SIGNIFICANT blocker needing human input halts.
+  # ═══════════════════════════════════════════════════════════════════════════
+  - id: merge-readiness
+    depends_on: [verify-pr-base]
+    model: opus
+    fallbackModel: sonnet
+    effort: high
+    idle_timeout: 1800000
+    loop:
+      prompt: |
+        # Drive the PR to MERGED, autonomously
+
+        You are the implementation engineer (Claude) shepherding this PR all the way to a merged, governed state WITHOUT
+        routine human check-ins. This loop auto-continues each iteration (no user gate), so keep
+        making progress and re-checking until the PR is merged.
+
+        **User's permission decisions (auto-merge? apply manual steps?)**: $permissions-gate.output
+
+        ## RELOAD STATE (this is a fresh session — no memory of prior iterations)
+        Reconstruct from durable memory + live queries; don't assume you remember anything:
+        - Read `$ARTIFACTS_DIR/merge/status.md` if it exists (blockers/decisions from prior rounds).
+        - Previous iteration's summary (may be empty on the first pass): $LOOP_PREV_OUTPUT
+        - Identify the PR and its LIVE state (this is the source of truth):
+          `gh pr view --json number,url,state,mergeable,mergeStateStatus,reviewDecision,autoMergeRequest,statusCheckRollup`
+
+        ## If the PR is already MERGED
+        Report it merged and emit `<promise>MERGE_DONE</promise>`.
+
+        ## Otherwise, do the autonomous work this iteration
+        1. **Conflicts / rebase**: `git fetch origin "$BASE_BRANCH"`. If behind or conflicted,
+           rebase the latest base into the branch: `git rebase "origin/$BASE_BRANCH"`, resolve
+           conflicts correctly, and `git push --force-with-lease`.
+        2. **Gemini code assist**: auto-invoked on PR creation; can take a couple of minutes up to
+           ~20 minutes, may be absent, and may error. Fetch review threads via `gh api graphql`
+           (`reviewThreads`) or `gh pr view --json comments,reviews`.
+        3. **Address comments (relevant only)**: for Gemini/any reviewer comments that are
+           RELEVANT and warranted, apply fixes per best practices, commit, push. Fold small issues
+           in directly. For comments you decline (out-of-scope/pre-existing/stylistic/incorrect),
+           reply briefly with the reason. Then RESOLVE the conversations you handled (GraphQL
+           `resolveReviewThread`).
+        4. **Required CI**: `gh pr checks`. If a required check fails and the fix is small/clear,
+           fix + push. (See the significant-blocker rule for larger failures.)
+        5. **Auto-merge**: if the user authorized it and the PR is (or is becoming) green,
+           conflict-free, and conversations are resolved, ARM it: `gh pr merge --auto --squash`.
+           If not authorized, do not arm it.
+
+        ## Routine waiting (do NOT stop for this)
+        If you are simply waiting on Gemini/CI to finish, or watching an armed auto-merge, that is
+        normal. Do a short `sleep 60` (emit a progress line first so you don't idle-timeout), then
+        end the iteration WITHOUT the completion signal — the loop auto-continues and you re-check
+        next iteration. Keep monitoring across iterations until GitHub actually merges the PR.
+
+        ## SIGNIFICANT blocker needing human input (this is the ONLY thing that should stop us)
+        If you hit something that genuinely needs a human decision — a required CI failure that
+        implies a design change, an unsafe/irreversible action, branch protection requiring a human
+        approval that won't come automatically, a Gemini comment implying a scope/design change, or
+        a required [MANUAL] step that must happen before merge — do NOT guess. Write the blocker,
+        a recommended fix, and alternatives to `$ARTIFACTS_DIR/merge/status.md`, then emit
+        `<promise>MERGE_DONE</promise>` so the run concludes and surfaces it (final-summary will
+        report it as BLOCKED — the operator acts and re-runs the merge step if needed).
+
+        ## Completion
+        Emit `<promise>MERGE_DONE</promise>` when the PR is MERGED, or when you have hit a
+        significant blocker (documented in `$ARTIFACTS_DIR/merge/status.md`), or — if the user did
+        NOT authorize auto-merge — when the PR is fully green, conflict-free, and all conversations
+        (including Gemini) are resolved and you have reported it ready for the operator to merge.
+        Otherwise (routine waiting) end the iteration without the signal.
+
+        Always end each iteration with a concise status: merged? · conflicts · CI · Gemini/threads ·
+        auto-merge state · blocked-on-human?
+      until: MERGE_DONE
+      max_iterations: 60
+      # Stateless polling iterations: each round re-derives PR state from gh/git + status.md
+      # rather than accumulating 60 iterations of transcript — the only sound way to poll long.
+      fresh_context: true
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # PHASE 10: OPERATOR HANDOFF — final summary incl. merged/blocked state,
+  #   remaining MANUAL steps + timing, and a verification confirmation.
+  # ═══════════════════════════════════════════════════════════════════════════
+  - id: final-summary
+    depends_on: [merge-readiness]
+    context: fresh
+    model: sonnet
+    effort: high
+    trigger_rule: all_done
+    idle_timeout: 300000
+    prompt: |
+      Produce the operator handoff summary for this run. Read `$ARTIFACTS_DIR/design/design.md`,
+      `$ARTIFACTS_DIR/plan/plan.md`, `$ARTIFACTS_DIR/plan/progress.md`,
+      `$ARTIFACTS_DIR/merge/status.md` (if present), and
+      `gh pr view --json url,state,mergeStateStatus,autoMergeRequest`.
+
+      Output:
+      - **Outcome**: MERGED / READY-FOR-MANUAL-MERGE / BLOCKED (needs human) — with the PR URL.
+        If BLOCKED, quote the blocker + recommended fix from status.md prominently at the top.
+      - **Auto-merge**: armed / merged / not armed (and why).
+      - **Remaining MANUAL steps**: the [MANUAL] table from the plan, each with recommended timing
+        (prefer after-merge from latest `$BASE_BRANCH`; note any that require rebasing latest base
+        into the branch before the action, e.g. bootstrap `terraform apply`).
+      - **Verification**: confirm the implementation matches the agreed design and its verification
+        criteria are satisfied (goal achieved, working as intended), or flag residual gaps.
