@@ -37,6 +37,73 @@ Only a genuinely **significant blocker** needing human input surfaces and halts 
 autonomous phase; routine issues (waiting on CI, small review nits, rebases) are folded in
 automatically.
 
+## Workflow DAG
+
+The node graph below is derived from the `depends_on` edges in
+`.archon/workflows/feature-dev-governed.yaml`. Independent nodes in the same layer run
+**concurrently** — `research-fable` ∥ `research-codex` both branch from `setup`, and
+`review-opus` ∥ `review-codex` both branch from `implement`.
+
+```mermaid
+flowchart TD
+    subgraph upfront["Upfront — human-in-the-loop"]
+        setup[["setup"]]
+        research-fable("research-fable")
+        research-codex("research-codex")
+        synthesize("synthesize")
+        design{{"design (loop)"}}
+        plan("plan")
+        permissions-gate[/"permissions-gate (approval)"/]
+
+        setup --> research-fable
+        setup --> research-codex
+        research-fable --> synthesize
+        research-codex --> synthesize
+        synthesize --> design
+        design --> plan
+        plan --> permissions-gate
+    end
+
+    subgraph autonomous["Autonomous"]
+        docs-pr("docs-pr")
+        implement("implement")
+        review-opus("review-opus")
+        review-codex("review-codex")
+        address-reviews{{"address-reviews (loop)"}}
+        create-pr("create-pr")
+        verify-pr-base[["verify-pr-base"]]
+        merge-readiness{{"merge-readiness (loop)"}}
+        final-summary("final-summary")
+
+        docs-pr --> implement
+        implement --> review-opus
+        implement --> review-codex
+        review-opus --> address-reviews
+        review-codex --> address-reviews
+        address-reviews --> create-pr
+        create-pr --> verify-pr-base
+        verify-pr-base --> merge-readiness
+        merge-readiness --> final-summary
+    end
+
+    permissions-gate --> docs-pr
+
+    classDef bash fill:#e8eaf6,stroke:#5c6bc0,color:#1a237e;
+    classDef ai fill:#e0f2f1,stroke:#26a69a,color:#004d40;
+    classDef loop fill:#fff8e1,stroke:#ffb300,color:#e65100;
+    classDef approval fill:#fce4ec,stroke:#ec407a,color:#880e4f;
+
+    class setup,verify-pr-base bash;
+    class research-fable,research-codex,synthesize,plan,docs-pr,implement,review-opus,review-codex,create-pr,final-summary ai;
+    class design,address-reviews,merge-readiness loop;
+    class permissions-gate approval;
+```
+
+**Legend** — shapes/colors by node type: `[[double-bracket]]` blue = **bash** (deterministic
+shell, no AI); `(rounded)` teal = **AI prompt** node; `{{hexagon}}` amber = **loop** node
+(iterates until a completion signal — `design`, `address-reviews`, `merge-readiness`);
+`[/parallelogram/]` pink = **approval** gate (`permissions-gate`, pauses for human approve/reject).
+
 ## Prerequisites
 
 - [ ] **An Archon build that includes loop model/effort forwarding + the `xhigh` effort
@@ -143,6 +210,46 @@ Useful flags:
 
 By default Archon runs the workflow in a fresh git worktree cut from the base branch, opens
 its PR from there, and drives it to merge.
+
+## Running the Web UI (frontend + backend)
+
+The Web UI belongs to **Archon itself**, not to this harness repo — but it is a natural way
+to run this workflow, because `feature-dev-governed` is `interactive: true`: its design loop
+and permission gate surface as in-browser prompts you answer without touching the CLI.
+
+**Start the server + Web UI:**
+
+- **From an Archon source checkout:**
+  ```bash
+  bun run dev          # backend (server) on :3090 + web UI on :5173, both with hot reload
+  # or individually:
+  bun run dev:server   # backend only (:3090)
+  bun run dev:web      # frontend only (:5173)
+  ```
+- **From a binary/compiled install:**
+  ```bash
+  archon serve             # downloads the web UI on first run, then serves the console
+  archon serve --port 4000 # custom port
+  ```
+
+**Backend (server, `:3090`)** — Archon's engine. It executes workflows, streams run events
+over SSE, and exposes the REST API (`/api/workflows`, workflow runs, run artifacts, config).
+The platform adapters (Slack/Telegram/GitHub/Discord) run in this process too.
+
+**Frontend (web UI, `:5173` in dev)** — the console. Tied to this workflow, it lets you:
+
+- browse and launch workflows (including `feature-dev-governed`);
+- use the **visual workflow builder (Archon Studio)** to view/edit the DAG;
+- **drive the interactive parts in-browser** — answer the design loop's clarifying questions
+  and **approve/reject the permission gate** without the CLI;
+- watch **live run progress** (per-node status streamed over SSE);
+- open **run artifacts** (`design.md` / `plan.md` / review notes);
+- manage codebases/projects;
+- configure **AI settings** — model tiers/aliases and provider credentials.
+
+The CLI path still works exactly as in the [Run](#run) section
+(`archon workflow run feature-dev-governed …`); the web UI is just the more comfortable
+surface for this workflow's upfront human-in-the-loop steps.
 
 ## Customizing
 
